@@ -3,19 +3,15 @@ package commands
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
-	"strings"
 	"text/template"
 
-	"github.com/docker/machine/log"
-
 	"github.com/codegangsta/cli"
-	"github.com/docker/machine/utils"
+	"github.com/docker/machine/libmachine/log"
 )
 
 const (
-	envTmpl = `{{ .Prefix }}DOCKER_TLS_VERIFY{{ .Delimiter }}{{ .DockerTLSVerify }}{{ .Suffix }}{{ .Prefix }}DOCKER_HOST{{ .Delimiter }}{{ .DockerHost }}{{ .Suffix }}{{ .Prefix }}DOCKER_CERT_PATH{{ .Delimiter }}{{ .DockerCertPath }}{{ .Suffix }}{{ .Prefix }}DOCKER_MACHINE_NAME{{ .Delimiter }}{{ .MachineName }}{{ .Suffix }}{{ if .NoProxyVar }}{{ .Prefix }}{{ .NoProxyVar }}{{ .Delimiter }}{{ .NoProxyValue }}{{ .Suffix }}{{end}}{{ .UsageHint }}`
+	envTmpl = `{{ .Prefix }}DOCKER_TLS_VERIFY{{ .Delimiter }}{{ .DockerTLSVerify }}{{ .Suffix }}{{ .Prefix }}DOCKER_HOST{{ .Delimiter }}{{ .DockerHost }}{{ .Suffix }}{{ .Prefix }}DOCKER_CERT_PATH{{ .Delimiter }}{{ .DockerCertPath }}{{ .Suffix }}{{ .Prefix }}DOCKER_MACHINE_NAME{{ .Delimiter }}{{ .MachineName }}{{ .Suffix }}{{ .UsageHint }}`
 )
 
 var (
@@ -31,14 +27,20 @@ type ShellConfig struct {
 	DockerTLSVerify string
 	UsageHint       string
 	MachineName     string
-	NoProxyVar      string
-	NoProxyValue    string
 }
 
 func cmdEnv(c *cli.Context) {
 	if len(c.Args()) != 1 && !c.Bool("unset") {
 		log.Fatal(improperEnvArgsError)
 	}
+
+	h := getFirstArgHost(c)
+
+	dockerHost, authOptions, err := runConnectionBoilerplate(h, c)
+	if err != nil {
+		log.Fatalf("Error running connection boilerplate: %s", err)
+	}
+
 	userShell := c.String("shell")
 	if userShell == "" {
 		shell, err := detectShell()
@@ -57,8 +59,6 @@ func cmdEnv(c *cli.Context) {
 		DockerHost:      "",
 		DockerTLSVerify: "",
 		MachineName:     "",
-		NoProxyVar:      "",
-		NoProxyValue:    "",
 	}
 
 	// unset vars
@@ -97,89 +97,12 @@ func cmdEnv(c *cli.Context) {
 		return
 	}
 
-	cfg, err := getMachineConfig(c)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if cfg.machineUrl == "" {
-		log.Fatalf("%s is not running. Please start this with %s start %s", cfg.machineName, c.App.Name, cfg.machineName)
-	}
-
-	dockerHost := cfg.machineUrl
-	u, err := url.Parse(cfg.machineUrl)
-	if err != nil {
-		log.Fatal(err)
-	}
-	//extract the ip from the docker host
-	mParts := strings.Split(u.Host, ":")
-	machineIp := mParts[0]
-
-	if c.Bool("swarm") {
-		if !cfg.SwarmOptions.Master {
-			log.Fatalf("%s is not a swarm master", cfg.machineName)
-		}
-		u, err := url.Parse(cfg.SwarmOptions.Host)
-		if err != nil {
-			log.Fatal(err)
-		}
-		parts := strings.Split(u.Host, ":")
-		swarmPort := parts[1]
-
-		dockerHost = fmt.Sprintf("tcp://%s:%s", machineIp, swarmPort)
-	}
-
-	noProxyVar := ""
-	noProxyValue := ""
-	if c.Bool("no-proxy") {
-		//first check for an existing lower case no_proxy var
-		noProxyVar = "no_proxy"
-		noProxyValue = os.Getenv("no_proxy")
-		//otherwise default to allcaps NO_PROXY
-		if noProxyValue == "" {
-			noProxyVar = "NO_PROXY"
-			noProxyValue = os.Getenv("NO_PROXY")
-		}
-		//add the docker host to the no_proxy list idempotently
-		switch {
-		case noProxyValue == "":
-			noProxyValue = machineIp
-		case strings.Contains(noProxyValue, machineIp):
-			//ip already in no_proxy list, nothing to do
-		default:
-			noProxyValue = fmt.Sprintf("%s,%s", noProxyValue, machineIp)
-		}
-	}
-
-	if u.Scheme != "unix" {
-		// validate cert and regenerate if needed
-		valid, err := utils.ValidateCertificate(
-			u.Host,
-			cfg.caCertPath,
-			cfg.serverCertPath,
-			cfg.serverKeyPath,
-		)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		if !valid {
-			log.Debugf("invalid certs detected; regenerating for %s", u.Host)
-
-			if err := runActionWithContext("configureAuth", c); err != nil {
-				log.Fatal(err)
-			}
-		}
-	}
-
 	shellCfg = ShellConfig{
-		DockerCertPath:  cfg.machineDir,
+		DockerCertPath:  authOptions.CertDir,
 		DockerHost:      dockerHost,
 		DockerTLSVerify: "1",
 		UsageHint:       usageHint,
-		MachineName:     cfg.machineName,
-		NoProxyVar:      noProxyVar,
-		NoProxyValue:    noProxyValue,
+		MachineName:     h.Name,
 	}
 
 	switch userShell {
