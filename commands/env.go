@@ -3,15 +3,12 @@ package commands
 import (
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"text/template"
 
-	"github.com/docker/machine/log"
-
 	"github.com/codegangsta/cli"
-	"github.com/docker/machine/utils"
+	"github.com/docker/machine/libmachine/log"
 )
 
 const (
@@ -39,6 +36,14 @@ func cmdEnv(c *cli.Context) {
 	if len(c.Args()) != 1 && !c.Bool("unset") {
 		log.Fatal(improperEnvArgsError)
 	}
+
+	h := getFirstArgHost(c)
+
+	dockerHost, authOptions, err := runConnectionBoilerplate(h, c)
+	if err != nil {
+		log.Fatalf("Error running connection boilerplate: %s", err)
+	}
+
 	userShell := c.String("shell")
 	if userShell == "" {
 		shell, err := detectShell()
@@ -52,13 +57,42 @@ func cmdEnv(c *cli.Context) {
 
 	usageHint := generateUsageHint(c.App.Name, c.Args().First(), userShell)
 
-	shellCfg := ShellConfig{
-		DockerCertPath:  "",
-		DockerHost:      "",
-		DockerTLSVerify: "",
-		MachineName:     "",
-		NoProxyVar:      "",
-		NoProxyValue:    "",
+	shellCfg := &ShellConfig{
+		DockerCertPath:  authOptions.CertDir,
+		DockerHost:      dockerHost,
+		DockerTLSVerify: "1",
+		UsageHint:       usageHint,
+		MachineName:     h.Name,
+	}
+
+	if c.Bool("no-proxy") {
+		ip, err := h.Driver.GetIP()
+		if err != nil {
+			log.Fatalf("Error getting host IP: %s", err)
+		}
+
+		// first check for an existing lower case no_proxy var
+		noProxyVar := "no_proxy"
+		noProxyValue := os.Getenv("no_proxy")
+
+		// otherwise default to allcaps HTTP_PROXY
+		if noProxyValue == "" {
+			noProxyVar = "NO_PROXY"
+			noProxyValue = os.Getenv("NO_PROXY")
+		}
+
+		// add the docker host to the no_proxy list idempotently
+		switch {
+		case noProxyValue == "":
+			noProxyValue = ip
+		case strings.Contains(noProxyValue, ip):
+			//ip already in no_proxy list, nothing to do
+		default:
+			noProxyValue = fmt.Sprintf("%s,%s", noProxyValue, ip)
+		}
+
+		shellCfg.NoProxyVar = noProxyVar
+		shellCfg.NoProxyValue = noProxyValue
 	}
 
 	// unset vars
@@ -95,91 +129,6 @@ func cmdEnv(c *cli.Context) {
 			log.Fatal(err)
 		}
 		return
-	}
-
-	cfg, err := getMachineConfig(c)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	if cfg.machineUrl == "" {
-		log.Fatalf("%s is not running. Please start this with %s start %s", cfg.machineName, c.App.Name, cfg.machineName)
-	}
-
-	dockerHost := cfg.machineUrl
-	u, err := url.Parse(cfg.machineUrl)
-	if err != nil {
-		log.Fatal(err)
-	}
-	//extract the ip from the docker host
-	mParts := strings.Split(u.Host, ":")
-	machineIp := mParts[0]
-
-	if c.Bool("swarm") {
-		if !cfg.SwarmOptions.Master {
-			log.Fatalf("%s is not a swarm master", cfg.machineName)
-		}
-		u, err := url.Parse(cfg.SwarmOptions.Host)
-		if err != nil {
-			log.Fatal(err)
-		}
-		parts := strings.Split(u.Host, ":")
-		swarmPort := parts[1]
-
-		dockerHost = fmt.Sprintf("tcp://%s:%s", machineIp, swarmPort)
-	}
-
-	noProxyVar := ""
-	noProxyValue := ""
-	if c.Bool("no-proxy") {
-		//first check for an existing lower case no_proxy var
-		noProxyVar = "no_proxy"
-		noProxyValue = os.Getenv("no_proxy")
-		//otherwise default to allcaps NO_PROXY
-		if noProxyValue == "" {
-			noProxyVar = "NO_PROXY"
-			noProxyValue = os.Getenv("NO_PROXY")
-		}
-		//add the docker host to the no_proxy list idempotently
-		switch {
-		case noProxyValue == "":
-			noProxyValue = machineIp
-		case strings.Contains(noProxyValue, machineIp):
-			//ip already in no_proxy list, nothing to do
-		default:
-			noProxyValue = fmt.Sprintf("%s,%s", noProxyValue, machineIp)
-		}
-	}
-
-	if u.Scheme != "unix" {
-		// validate cert and regenerate if needed
-		valid, err := utils.ValidateCertificate(
-			u.Host,
-			cfg.caCertPath,
-			cfg.serverCertPath,
-			cfg.serverKeyPath,
-		)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		if !valid {
-			log.Debugf("invalid certs detected; regenerating for %s", u.Host)
-
-			if err := runActionWithContext("configureAuth", c); err != nil {
-				log.Fatal(err)
-			}
-		}
-	}
-
-	shellCfg = ShellConfig{
-		DockerCertPath:  cfg.machineDir,
-		DockerHost:      dockerHost,
-		DockerTLSVerify: "1",
-		UsageHint:       usageHint,
-		MachineName:     cfg.machineName,
-		NoProxyVar:      noProxyVar,
-		NoProxyValue:    noProxyValue,
 	}
 
 	switch userShell {
